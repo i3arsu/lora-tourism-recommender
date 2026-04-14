@@ -90,16 +90,6 @@
     }
   },
   {
-    "type": "nature",
-    "properties": {
-      "name": "Brijunska bara",
-      "tags": null,
-      "description": "remove",
-      "rating": null,
-      "reviews": null
-    }
-  },
-  {
     "type": "park",
     "properties": {
       "name": "Valerijin park",
@@ -875,16 +865,6 @@
       "name": "Otisci stopala dinosaura",
       "tags": "board",
       "description": null,
-      "rating": null,
-      "reviews": null
-    }
-  },
-  {
-    "type": "information",
-    "properties": {
-      "name": "Brijunska bara",
-      "tags": "board",
-      "description": "remove",
       "rating": null,
       "reviews": null
     }
