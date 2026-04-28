@@ -1,0 +1,6 @@
+venv/
+
+*.pbs
+.github/agents/ai-engineer-model-testing.agent.md
+__pycache__/prompt-eval-tourism.cpython-36.pyc
+tourism_prompt_eval.o925324
