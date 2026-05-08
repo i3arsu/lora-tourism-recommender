@@ -54,6 +54,7 @@ Output schema (strict):
       "name": "<exact place name from candidates>",
       "type": "<place type>",
       "score": <integer 0-100>,
+            "short_answer": "<very short answer>",
       "reason": "<short grounded reason>",
       "matched_tags": ["<tag1>", "<tag2>"]
     }}
@@ -64,7 +65,7 @@ Rules:
 1. Return exactly {top_k} recommendations whenever enough candidates exist.
 2. Use exact place names from candidates.
 3. Ground reasons in the provided profile preferences and candidate metadata.
-4. Keep reasons concise (1 sentence).
+4. Keep short_answer concise (max 8 words) and reason concise (1 sentence).
 5. Do not output any text before or after JSON.
 6. Do not use <think> tags.
 """.strip()
@@ -325,28 +326,51 @@ def build_inputs(system_prompt: str, user_input: str, tokenizer):
 
 
 def load_model_and_tokenizer(model_id: str, offload_folder: str, gpu_memory_gib: int):
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            quantization_config=bnb_config,
-            device_map={"": 0},
-            max_memory={0: f"{gpu_memory_gib}GiB"},
-            trust_remote_code=True,
+    n_gpus = torch.cuda.device_count()
+    if n_gpus >= 2:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
         )
+        load_label = f"multi-GPU 4-bit path ({n_gpus} GPUs)"
+        load_kwargs = {
+            "quantization_config": bnb_config,
+            "device_map": "auto",
+            "trust_remote_code": True,
+        }
+    else:
+        # Single A100-40GB path: 4-bit has a better chance to fit than 8-bit.
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        load_label = "single-GPU 4-bit path"
+        load_kwargs = {
+            "quantization_config": bnb_config,
+            "device_map": {"": 0},
+            "max_memory": {0: f"{gpu_memory_gib}GiB"},
+            "trust_remote_code": True,
+        }
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     except (ValueError, RuntimeError) as e:
         message = str(e)
         raise RuntimeError(
-            "Model loading failed on single-GPU 8-bit path. "
-            "This environment currently crashes in CPU/disk offload hooks, so offload fallback is disabled. "
-            "Try lowering --gpu-memory-gib (e.g. 34), requesting a larger GPU, or using a smaller model. "
+            f"Model loading failed on {load_label}. "
+            "CPU/disk offload fallback is disabled due environment hook incompatibility. "
+            "Try increasing requested GPUs, reducing --gpu-memory-gib a bit (e.g. 34), or using a smaller model. "
             f"Original error: {message}"
         ) from e
 
@@ -445,14 +469,35 @@ def normalize_recommendation_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(matched_tags, list):
         matched_tags = []
 
+    short_answer = str(item.get("short_answer") or item.get("short") or "").strip()
     reason = str(item.get("reason", "")).strip()
+    if not short_answer:
+        short_answer = reason
 
     return {
         "name": str(name).strip(),
         "type": normalize_token(item_type),
         "score": score,
+        "short_answer": short_answer,
         "reason": reason,
         "matched_tags": [normalize_token(x) for x in matched_tags if x],
+    }
+
+
+def build_heuristic_payload(candidates: List[Place], top_k: int, reason: str) -> Dict[str, Any]:
+    picks = candidates[:top_k]
+    return {
+        "recommendations": [
+            {
+                "name": p.name,
+                "type": p.place_type,
+                "score": max(50, 85 - i),
+                "short_answer": "Good fit for your preferences.",
+                "reason": reason,
+                "matched_tags": [],
+            }
+            for i, p in enumerate(picks)
+        ]
     }
 
 
@@ -588,6 +633,15 @@ def write_summary_csv(rows: List[Dict[str, Any]], path: str) -> None:
         writer.writerows(rows)
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def run(args: argparse.Namespace) -> None:
     maybe_login_hf()
 
@@ -610,6 +664,10 @@ def run(args: argparse.Namespace) -> None:
         args.output_dir,
         f"tourism_eval_raw_{sanitized_model_name}_{timestamp}.jsonl",
     )
+    raw_only_path = os.path.join(
+        args.output_dir,
+        f"tourism_eval_raw_unparsed_{sanitized_model_name}_{timestamp}.jsonl",
+    )
     csv_path = os.path.join(
         args.output_dir,
         f"tourism_eval_summary_{sanitized_model_name}_{timestamp}.csv",
@@ -621,6 +679,7 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"Loaded {len(places)} places and {len(profiles)} profiles.")
     print(f"Output JSONL: {jsonl_path}")
+    print(f"Output Raw JSONL: {raw_only_path}")
     print(f"Output CSV: {csv_path}")
 
     model = None
@@ -638,6 +697,8 @@ def run(args: argparse.Namespace) -> None:
     summary_rows: List[Dict[str, Any]] = []
     aggregate_metrics = {
         "valid_json_count": 0,
+        "parse_error_rows": 0,
+        "fallback_rows": 0,
         "rows": 0,
         "recommendation_validity_rate_sum": 0.0,
         "avg_tag_overlap_sum": 0.0,
@@ -650,28 +711,22 @@ def run(args: argparse.Namespace) -> None:
         "gold_rows": 0,
     }
 
-    with open(jsonl_path, "w", encoding="utf-8") as jsonl_f:
+    start_time = datetime.now(UTC)
+
+    with open(jsonl_path, "w", encoding="utf-8") as jsonl_f, open(raw_only_path, "w", encoding="utf-8") as raw_f:
         for idx, profile in enumerate(profiles):
-            if (idx + 1) % 25 == 0:
-                print(f"Processing profile {idx + 1}/{len(profiles)}")
+            current = idx + 1
+            user_prompt = ""
 
             scored = filter_and_score_candidates(profile, places, strict_price=args.strict_price)
             candidate_places = [x[0] for x in scored[: args.candidate_limit]]
 
             if args.no_model:
-                heuristic_top = candidate_places[: args.top_k]
-                parsed = {
-                    "recommendations": [
-                        {
-                            "name": p.name,
-                            "type": p.place_type,
-                            "score": 80 - i,
-                            "reason": "Heuristic fallback recommendation.",
-                            "matched_tags": [],
-                        }
-                        for i, p in enumerate(heuristic_top)
-                    ]
-                }
+                parsed = build_heuristic_payload(
+                    candidate_places,
+                    args.top_k,
+                    reason="Heuristic fallback recommendation.",
+                )
                 raw_response = json.dumps(parsed, ensure_ascii=False)
                 parse_error = ""
             else:
@@ -686,6 +741,19 @@ def run(args: argparse.Namespace) -> None:
                     temperature=args.temperature,
                 )
                 parsed, parse_error = extract_json_payload(raw_response)
+                if not parsed:
+                    # Keep the run productive even when the model returns non-JSON text.
+                    parsed = build_heuristic_payload(
+                        candidate_places,
+                        args.top_k,
+                        reason="Fallback used because model response was not valid JSON.",
+                    )
+                    parse_error = f"{parse_error}|heuristic_fallback"
+
+            if parse_error:
+                aggregate_metrics["parse_error_rows"] += 1
+            if "heuristic_fallback" in parse_error:
+                aggregate_metrics["fallback_rows"] += 1
 
             valid_json = int(bool(parsed))
             aggregate_metrics["valid_json_count"] += valid_json
@@ -742,6 +810,19 @@ def run(args: argparse.Namespace) -> None:
                 "ndcg_at_k": ndcg_k,
             }
             jsonl_f.write(json.dumps(raw_record, ensure_ascii=False) + "\n")
+            jsonl_f.flush()
+
+            raw_only_record = {
+                "user_id": user_id,
+                "query": profile.get("input"),
+                "candidate_count": len(candidate_places),
+                "parse_error": parse_error,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "raw_response": raw_response,
+            }
+            raw_f.write(json.dumps(raw_only_record, ensure_ascii=False) + "\n")
+            raw_f.flush()
 
             summary_row: Dict[str, Any] = {
                 "user_id": user_id,
@@ -766,19 +847,38 @@ def run(args: argparse.Namespace) -> None:
                 col_name = f"top_{k + 1}_name"
                 col_type = f"top_{k + 1}_type"
                 col_score = f"top_{k + 1}_score"
+                col_short_answer = f"top_{k + 1}_short_answer"
                 if k < len(recommendations):
                     summary_row[col_name] = recommendations[k].get("name")
                     summary_row[col_type] = recommendations[k].get("type")
                     summary_row[col_score] = recommendations[k].get("score")
+                    summary_row[col_short_answer] = recommendations[k].get("short_answer")
                 else:
                     summary_row[col_name] = ""
                     summary_row[col_type] = ""
                     summary_row[col_score] = ""
+                    summary_row[col_short_answer] = ""
 
             summary_rows.append(summary_row)
 
             if (idx + 1) % args.save_every == 0:
                 write_summary_csv(summary_rows, csv_path)
+
+            if current % args.progress_every == 0 or current == len(profiles):
+                elapsed_sec = (datetime.now(UTC) - start_time).total_seconds()
+                avg_per_profile = elapsed_sec / max(1, current)
+                remaining = len(profiles) - current
+                eta_sec = avg_per_profile * remaining
+                parse_error_rate = aggregate_metrics["parse_error_rows"] / max(1, current)
+                fallback_rate = aggregate_metrics["fallback_rows"] / max(1, current)
+                print(
+                    f"Progress {current}/{len(profiles)} "
+                    f"({100.0 * current / len(profiles):.1f}%) | "
+                    f"elapsed {format_duration(elapsed_sec)} | "
+                    f"ETA {format_duration(eta_sec)} | "
+                    f"parse_error_rate {parse_error_rate:.3f} | "
+                    f"fallback_rate {fallback_rate:.3f}"
+                )
 
     write_summary_csv(summary_rows, csv_path)
 
@@ -791,8 +891,11 @@ def run(args: argparse.Namespace) -> None:
         "places_file": args.places_file,
         "profiles_file": args.profiles_file,
         "labels_file": args.labels_file,
+        "raw_unparsed_jsonl": raw_only_path,
         "rows_processed": aggregate_metrics["rows"],
         "valid_json_rate": aggregate_metrics["valid_json_count"] / rows,
+        "parse_error_rate": aggregate_metrics["parse_error_rows"] / rows,
+        "fallback_rate": aggregate_metrics["fallback_rows"] / rows,
         "avg_recommendation_validity_rate": aggregate_metrics["recommendation_validity_rate_sum"] / rows,
         "avg_tag_overlap": aggregate_metrics["avg_tag_overlap_sum"] / rows,
         "avg_rating_compliance_rate": aggregate_metrics["rating_compliance_rate_sum"] / rows,
@@ -843,6 +946,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--strict-price", action="store_true")
     parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--offload-folder", type=str, default="./offload")
     parser.add_argument("--gpu-memory-gib", type=int, default=36)
     parser.add_argument(
